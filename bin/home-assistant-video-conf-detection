@@ -1,0 +1,82 @@
+#!/usr/bin/env ruby
+
+require 'mixlib/shellout'
+require 'mqtt'
+require 'json'
+
+# @param [Regexp] optional regexp to filter existing video devices
+# @return [String] the path of the matching device
+# @raise [RuntimeError] if no matching device is found
+def detect_cameras(match: nil)
+  Dir.glob('/dev/video*').sort.map do |device|
+    name = Mixlib::ShellOut.new("udevadm info --query=all '#{device}'")
+                           .run_command.tap(&:error!)
+                           .stdout.lines.select { |line| line =~ /ID_MODEL/ }
+                           .reject { |line| match && line !~ match }
+                           .first
+    device if name
+  end.compact
+end
+
+# @param [String] a path to a device
+def user_of(device)
+  pid = Mixlib::ShellOut.new("fuser #{device}").run_command.tap(&:error!).stdout.to_i
+  File.readlink("/proc/#{pid}/exe")
+end
+
+def detect_binaries
+  detect_cameras.map do |cam|
+    binaries = begin
+    [cam, user_of(cam)]
+    rescue StandardError => e
+    puts "Impossible to detect what is using #{cam}. Error was #{e.message}"
+    nil
+    end
+  end.compact
+end
+
+opts = {}
+opts[:username] = ENV['MQTT_USER'] if ENV['MQTT_USER']
+opts[:password] = ENV['MQTT_PASSWORD'] if ENV['MQTT_PASSWORD']
+raise 'MQTT_HOST env variable must be set' unless ENV['MQTT_HOST']
+unique_id = ENV['UNIQUE_ID']
+
+MQTT::Client.connect(ENV['MQTT_HOST'], **opts) do |client|
+  topic_prefix = "homeassistant/binary_sensor/#{unique_id}"
+  topic_state = "#{topic_prefix}/state"
+  attributes_topic = "#{topic_prefix}/attributes"
+  config = {
+    name: 'Video conference',
+    device_class: 'occupancy',
+    state_topic: topic_state,
+    unique_id: unique_id,
+    json_attributes_topic: attributes_topic,
+  }
+  if ENV['DELETE_FIRST']
+    client.publish("#{topic_prefix}/config", '', false)
+    puts "⚠ Deleting sensor first"
+  end
+
+  client.publish("#{topic_prefix}/config", config.to_json, false)
+  puts 'Configuration published ✔'
+
+  loop do
+    begin
+      binaries = detect_binaries
+      next unless binaries.any?
+
+      cam = binaries.first[0]
+      binary = binaries.first[1]
+      puts "#{binary} is using the camera #{cam}"
+      value = binary ? 'ON' : 'OFF'
+      payload = { value: value, camera: cam, binary: binary }
+      client.publish(topic_state, value, false)
+      client.publish(attributes_topic, payload.to_json, false)
+      puts "State message published ✔ (#{value})"
+    end
+  rescue StandardError => e
+    puts "General error: #{e.class.name} #{e.message}"
+  ensure
+    sleep(10)
+  end
+end
