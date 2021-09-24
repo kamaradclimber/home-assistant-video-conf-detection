@@ -27,10 +27,10 @@ end
 def detect_binaries
   detect_cameras.map do |cam|
     binaries = begin
-    [cam, user_of(cam)]
+      [cam, user_of(cam)]
     rescue StandardError => e
-    puts "Impossible to detect what is using #{cam}. Error was #{e.message}"
-    nil
+      puts "Impossible to detect what is using #{cam}. Error was #{e.message}"
+      nil
     end
   end.compact
 end
@@ -39,6 +39,7 @@ opts = {}
 opts[:username] = ENV['MQTT_USER'] if ENV['MQTT_USER']
 opts[:password] = ENV['MQTT_PASSWORD'] if ENV['MQTT_PASSWORD']
 raise 'MQTT_HOST env variable must be set' unless ENV['MQTT_HOST']
+
 unique_id = ENV['UNIQUE_ID']
 
 MQTT::Client.connect(ENV['MQTT_HOST'], **opts) do |client|
@@ -50,11 +51,11 @@ MQTT::Client.connect(ENV['MQTT_HOST'], **opts) do |client|
     device_class: 'occupancy',
     state_topic: topic_state,
     unique_id: unique_id,
-    json_attributes_topic: attributes_topic,
+    json_attributes_topic: attributes_topic
   }
   if ENV['DELETE_FIRST']
     client.publish("#{topic_prefix}/config", '', false)
-    puts "⚠ Deleting sensor first"
+    puts '⚠ Deleting sensor first'
   end
 
   client.publish("#{topic_prefix}/config", config.to_json, false)
@@ -63,16 +64,21 @@ MQTT::Client.connect(ENV['MQTT_HOST'], **opts) do |client|
   loop do
     begin
       binaries = detect_binaries
-      next unless binaries.any?
 
-      cam = binaries.first[0]
-      binary = binaries.first[1]
-      puts "#{binary} is using the camera #{cam}"
-      value = binary ? 'ON' : 'OFF'
-      payload = { value: value, camera: cam, binary: binary }
+      value = 'OFF'
+      if binaries.any?
+        cam = binaries.first[0]
+        binary = binaries.first[1]
+        puts "#{binary} is using the camera #{cam}"
+        value = 'ON'
+        payload = { value: value, camera: cam, binary: binary }
+      end
       client.publish(topic_state, value, false)
-      client.publish(attributes_topic, payload.to_json, false)
       puts "State message published ✔ (#{value})"
+      if payload
+        client.publish(attributes_topic, payload.to_json, false)
+        puts "Attributes message published ✔ (#{value})"
+      end
     end
   rescue StandardError => e
     puts "General error: #{e.class.name} #{e.message}"
