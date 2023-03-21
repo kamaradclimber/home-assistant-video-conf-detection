@@ -18,10 +18,33 @@ def detect_cameras(match: nil)
   end.compact
 end
 
+def detect_zoom_window
+  detect_cmd = Mixlib::ShellOut.new(%(wmctrl -l|awk '{$3=""; $2=""; $1=""; print $0}')).run_command
+  if detect_cmd.error?
+    puts "Impossible to detect open windows"
+    false
+  else
+    detect_cmd.stdout.split("\n").any? { |line| line =~ /zoom meeting/i }
+  end
+end
+
 # @param [String] a path to a device
 def user_of(device)
-  pid = Mixlib::ShellOut.new("fuser #{device}").run_command.tap(&:error!).stdout.to_i
+  pid_cmd = Mixlib::ShellOut.new("fuser #{device}").run_command
+  return nil if pid_cmd.error? && pid_cmd.stdout.empty? && pid_cmd.stderr.empty?
+
+  pid = pid_cmd.stdout.to_i
   File.readlink("/proc/#{pid}/exe")
+end
+
+def count_user
+  user_count = Mixlib::ShellOut.new(%(lsmod | grep ^uvcvideo | awk '{print $3}'))
+  user_count.run_command
+  if user_count.error?
+    0
+  else
+    user_count.stdout.to_i
+  end
 end
 
 def detect_binaries
@@ -40,7 +63,10 @@ opts[:username] = ENV['MQTT_USER'] if ENV['MQTT_USER']
 opts[:password] = ENV['MQTT_PASSWORD'] if ENV['MQTT_PASSWORD']
 raise 'MQTT_HOST env variable must be set' unless ENV['MQTT_HOST']
 
-unique_id = ENV['UNIQUE_ID']
+unique_id = ENV['UNIQUE_ID'] || 'video_conference_2'
+
+min_user = count_user
+
 
 MQTT::Client.connect(ENV['MQTT_HOST'], **opts) do |client|
   topic_prefix = "homeassistant/binary_sensor/#{unique_id}"
@@ -61,24 +87,50 @@ MQTT::Client.connect(ENV['MQTT_HOST'], **opts) do |client|
   client.publish("#{topic_prefix}/config", config.to_json, false)
   puts 'Configuration published ✔'
 
+  previous = nil
   loop do
     begin
+      # HACK: pipewire captures webcam all the time apparently
+      # so we only whitelist zoom for now
       binaries = detect_binaries
+        .select { |_, program| program }
+        .select { |_, program| program =~ /zoom/ }
 
       value = 'OFF'
+      payload = {}
       if binaries.any?
         cam = binaries.first[0]
         binary = binaries.first[1]
-        puts "#{binary} is using the camera #{cam}"
         value = 'ON'
         payload = { value: value, camera: cam, binary: binary }
+        puts "#{binary} is using the camera #{cam}" if previous != payload
       end
+      if detect_zoom_window
+        cam = "unknown"
+        binary = "unknown"
+        value = 'ON'
+        payload = { value: value, camera: cam, binary: binary }
+        puts "Using zoom window as a method to detect webcam usage" if previous != payload
+      end
+
+      # we use a 3rd technique to see webcam usage
+      # this method is not reliable and detect something immediately after X starts
+      # if value == 'OFF' && count_user > min_user # poor's man detection
+      #   cam = "unknown"
+      #   binary = "unknown"
+      #   value = 'ON'
+      #   payload = { value: value, camera: cam, binary: binary }
+      #   puts "Using poor's man method to detect webcam usage" if previous != payload
+      # end
+      min_user = [min_user, count_user].min
+
       client.publish(topic_state, value, false)
-      puts "State message published ✔ (#{value})"
+      puts "State message published ✔ (#{value})" if previous != payload
       if payload
         client.publish(attributes_topic, payload.to_json, false)
-        puts "Attributes message published ✔ (#{value})"
+        puts "Attributes message published ✔ (#{value})" if previous != payload
       end
+      previous = payload
     end
   rescue StandardError => e
     puts "General error: #{e.class.name} #{e.message}"
